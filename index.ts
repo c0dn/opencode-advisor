@@ -62,14 +62,20 @@ export default Plugin.define({
       options: context.options,
     }
 
+    // `goal: false` leaves /goal to another plugin.
+    const goalEnabled = context.options.goal !== false
     const failure = (error: unknown) => (error instanceof Error ? error.message : String(error))
     const rpc = await context.rpc.register(Advisor, {
+      async features() {
+        return { goal: goalEnabled }
+      },
       async advisor(input) {
         const { args } = input as { args: string }
         return { text: await advisorCommand(host, commandArgs("advisor", args)).catch(failure) }
       },
       async goal(input) {
         const { sessionID, args } = input as { sessionID: string; args: string }
+        if (!goalEnabled) return { text: "/goal is turned off in this plugin's options." }
         return { text: await goalCommand(host, sessionID, commandArgs("goal", args)).catch(failure) }
       },
     })
@@ -88,7 +94,7 @@ export default Plugin.define({
       })
     })
 
-    void resumeRunningGoals(host)
+    if (goalEnabled) void resumeRunningGoals(host)
 
     return async () => {
       await tools.dispose()

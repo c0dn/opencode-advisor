@@ -15,6 +15,15 @@ const reply = {
 export const Advisor = Rpc.define({
   id: "advisor",
   methods: {
+    features: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: { goal: { type: "boolean" } },
+        required: ["goal"],
+        additionalProperties: false,
+      },
+    },
     advisor: {
       input: { type: "object", properties: { args: { type: "string" } }, required: ["args"], additionalProperties: false },
       output: reply,

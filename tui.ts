@@ -1,12 +1,16 @@
 import { Plugin } from "@opencode/plugin/tui"
+import type { KeymapCommand } from "@opencode/plugin/tui/context"
 
 import { Advisor } from "./src/rpc.ts"
 
 /** /advisor and /goal: the server plugin does the work, this shows its replies. */
 export default Plugin.define({
   id: "opencode-advisor.tui",
-  setup(context) {
+  async setup(context) {
     const advisor = context.client.rpc(Advisor)
+    const features = (await advisor.features({}, { location: context.location ?? context.data.location.default() }).catch(() => ({
+      goal: true,
+    }))) as { goal: boolean }
 
     const currentSession = () => {
       const route = context.ui.router.current()
@@ -36,7 +40,7 @@ export default Plugin.define({
               .then((reply) => show("Advisor", (reply as { text: string }).text), (error) => fail("Advisor", error))
           },
         },
-        {
+        ...(!features.goal ? [] : [<KeymapCommand>{
           id: "advisor.goal",
           title: "Work on a goal until it is done",
           slash: { name: "goal", arguments: true },
@@ -47,7 +51,7 @@ export default Plugin.define({
               .goal({ sessionID, args: input ?? "" }, { location: locationOf(sessionID) })
               .then((reply) => show("Goal", (reply as { text: string }).text), (error) => fail("Goal", error))
           },
-        },
+        }]),
       ],
     }))
 

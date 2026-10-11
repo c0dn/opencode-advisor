@@ -9,7 +9,7 @@ An [OpenCode](https://opencode.ai) V2 plugin that gives the agent a second opini
 ## Install
 
 ```sh
-opencode plugin add @c0dn/opencode-advisor
+opencode plugin add github:c0dn/opencode-advisor
 ```
 
 Requires OpenCode 2.0 or later. The package has a server part (the tool, the goal loop and an RPC) and a TUI part (the slash commands, dialogs and toasts). OpenCode loads both automatically.

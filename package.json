@@ -1,0 +1,53 @@
+{
+  "name": "@c0dn/opencode-advisor",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin: an oracle_ask second-opinion tool, /advisor to pick its model, and /goal to keep working until the advisor judges a goal met.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./index.ts"
+    },
+    "./tui": {
+      "import": "./tui.ts"
+    }
+  },
+  "files": [
+    "index.ts",
+    "tui.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "advisor",
+    "oracle",
+    "goal"
+  ],
+  "author": "c0dn",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/c0dn/opencode-advisor.git"
+  },
+  "homepage": "https://github.com/c0dn/opencode-advisor#readme",
+  "bugs": {
+    "url": "https://github.com/c0dn/opencode-advisor/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.13",
+    "typescript": "^6.0.3"
+  }
+}

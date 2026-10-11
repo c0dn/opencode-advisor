@@ -7,7 +7,17 @@
     "skipLibCheck": true,
     "strict": true,
     "target": "ESNext",
-    "types": ["bun"]
+    "types": [
+      "bun"
+    ],
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid"
   },
-  "include": ["index.ts", "tui.ts", "src/*.ts", "test/*.ts"]
+  "include": [
+    "index.ts",
+    "tui.ts",
+    "src/*.ts",
+    "src/*.tsx",
+    "test/*.ts"
+  ]
 }

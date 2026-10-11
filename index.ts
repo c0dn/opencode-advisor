@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 
 import { advisorCommand, commandArgs, goalCommand } from "./src/commands.ts"
-import { resumeRunningGoals } from "./src/goal.ts"
+import { loadGoal, resumeRunningGoals } from "./src/goal.ts"
 import type { Host } from "./src/host.ts"
 import { askOracle } from "./src/oracle.ts"
 import { Advisor } from "./src/rpc.ts"
@@ -72,6 +72,9 @@ export default Plugin.define({
       async advisor(input) {
         const { args } = input as { args: string }
         return { text: await advisorCommand(host, commandArgs("advisor", args)).catch(failure) }
+      },
+      async goalStatus(input) {
+        return { goal: (await loadGoal(host, (input as { sessionID: string }).sessionID)) ?? null }
       },
       async goal(input) {
         const { sessionID, args } = input as { sessionID: string; args: string }

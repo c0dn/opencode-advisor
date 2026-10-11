@@ -28,6 +28,20 @@ export const Advisor = Rpc.define({
       input: { type: "object", properties: { args: { type: "string" } }, required: ["args"], additionalProperties: false },
       output: reply,
     },
+    goalStatus: {
+      input: {
+        type: "object",
+        properties: { sessionID: { type: "string" } },
+        required: ["sessionID"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: { goal: { type: ["object", "null"] } },
+        required: ["goal"],
+        additionalProperties: false,
+      },
+    },
     goal: {
       input: {
         type: "object",

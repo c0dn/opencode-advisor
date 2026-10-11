@@ -1,9 +1,11 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { KeymapCommand } from "@opencode/plugin/tui/context"
 
+import type { Goal } from "./src/goal.ts"
 import { Advisor } from "./src/rpc.ts"
+import { goalSidebar } from "./src/sidebar.tsx"
 
-/** /advisor and /goal: the server plugin does the work, this shows its replies. */
+/** /advisor, /goal and the sidebar's Goal section: the server plugin does the work, this shows it. */
 export default Plugin.define({
   id: "opencode-advisor.tui",
   async setup(context) {
@@ -55,11 +57,21 @@ export default Plugin.define({
       ],
     }))
 
-    return advisor.events.on("notice", (event) => {
+    const stopSidebar = features.goal
+      ? goalSidebar(context, async (sessionID) =>
+          ((await advisor.goalStatus({ sessionID }, { location: locationOf(sessionID) })) as { goal: Goal | null }).goal,
+        )
+      : () => {}
+
+    const stopNotices = advisor.events.on("notice", (event) => {
       const { sessionID, text } = event.data as { sessionID: string; text: string }
       const title = context.data.session.get(sessionID)?.title ?? "Goal"
       context.ui.toast.show({ title, message: text, duration: 10_000 })
       void context.attention.notify({ title: "OpenCode goal", message: text, notification: { when: "blurred" } })
     })
+    return () => {
+      stopSidebar()
+      stopNotices()
+    }
   },
 })

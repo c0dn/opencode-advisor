@@ -9,6 +9,8 @@ export interface ModelRef {
 }
 
 export interface Host {
+  /** Plugin unload stops controllers without changing persisted goals or jobs. */
+  signal?: AbortSignal;
   /** The session's model context: what its next request would carry. */
   context(sessionID: string): Promise<readonly unknown[]>;
   /** One completion with no tools, on `model` (the default model when absent). */

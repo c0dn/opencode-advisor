@@ -36,21 +36,22 @@ export async function advisorCommand(host: Host, args: string): Promise<string> 
 }
 
 export const GOAL_USAGE = `/goal <what done looks like> — start working autonomously until the advisor judges it met
-/goal --rounds <n> <goal> — the same, with a round limit (default ${DEFAULT_MAX_ROUNDS})
+/goal -n <count> <goal> — set a round limit (default: unlimited)
 /goal — show the current goal
 /goal stop — drop the goal (the turn in progress finishes)
-/goal resume [--rounds <n>] — continue a paused goal`;
+/goal resume [-n <count>] — continue with unlimited rounds, or at most count additional rounds`;
 
 function describe(goal: NonNullable<Awaited<ReturnType<typeof loadGoal>>>): string {
   const reason = goal.reason ? ` — ${goal.reason}` : "";
-  return `Goal (${goal.status}, round ${goal.round}/${goal.maxRounds})${reason}\n${goal.text}`;
+  return `Goal (${goal.status}, round ${goal.round}/${goal.maxRounds ?? "∞"})${reason}\n${goal.text}`;
 }
 
 function takeRounds(words: string[]): { rounds?: number; rest: string[] } {
-  const at = words.indexOf("--rounds");
+  if (words.includes("--rounds") || words.includes("-rounds")) throw new Error("Use -n <count> instead of --rounds.");
+  const at = words.indexOf("-n");
   if (at === -1) return { rest: words };
   const rounds = Number(words[at + 1]);
-  if (!Number.isInteger(rounds) || rounds < 1) throw new Error("--rounds needs a positive whole number.");
+  if (!Number.isSafeInteger(rounds) || rounds < 1 || words.lastIndexOf("-n") !== at) throw new Error("-n needs one positive whole number.");
   return { rounds, rest: [...words.slice(0, at), ...words.slice(at + 2)] };
 }
 
@@ -70,10 +71,10 @@ export async function goalCommand(host: Host, sessionID: string, args: string): 
   }
   if (verb === "resume" && rest.length === 1) {
     const goal = await resumeGoal(host, sessionID, rounds);
-    return `Resuming goal at round ${goal.round}/${goal.maxRounds}.`;
+    return `Resuming goal at round ${goal.round}/${goal.maxRounds ?? "∞"}.`;
   }
 
   const text = rest.join(" ");
   await startGoal(host, sessionID, text, rounds ?? DEFAULT_MAX_ROUNDS);
-  return `Goal started (up to ${rounds ?? DEFAULT_MAX_ROUNDS} rounds): ${text}`;
+  return `Goal started (${rounds === undefined ? "unlimited rounds" : `up to ${rounds} rounds`}): ${text}`;
 }

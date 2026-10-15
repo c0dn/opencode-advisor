@@ -20,7 +20,7 @@ export function GoalSection(props: { context: Context; sessionID: string; status
   const refresh = () =>
     props
       .status(props.sessionID)
-      .then((value) => setGoal(value && (value.status === "running" || value.status === "paused") ? value : null))
+      .then((value) => setGoal(value && ["running", "waiting", "paused"].includes(value.status) ? value : null))
       .catch(() => setGoal(null))
   void refresh()
   const timer = setInterval(() => void refresh(), POLL_MS)
@@ -35,11 +35,11 @@ export function GoalSection(props: { context: Context; sessionID: string; status
               Goal
             </text>
             <text fg={current().status === "paused" ? theme.text.subdued : theme.text.action.primary.default}>
-              {`${current().status} · ${current().round}/${current().maxRounds}`}
+              {`${current().status} · ${current().round}/${current().maxRounds ?? "∞"}`}
             </text>
           </box>
           <text fg={theme.text.default}>{`  ${shorten(current().text, 34)}`}</text>
-          <Show when={current().status === "paused" && current().reason}>
+          <Show when={current().status !== "running" && current().reason}>
             <text fg={theme.text.subdued}>{`  ${shorten(current().reason ?? "", 34)}`}</text>
           </Show>
         </box>

@@ -81,7 +81,7 @@ function shorten(text, length) {
 function GoalSection(props) {
   const theme = props.context.theme;
   const [goal, setGoal] = createSignal(null);
-  const refresh = () => props.status(props.sessionID).then((value) => setGoal(value && (value.status === "running" || value.status === "paused") ? value : null)).catch(() => setGoal(null));
+  const refresh = () => props.status(props.sessionID).then((value) => setGoal(value && ["running", "waiting", "paused"].includes(value.status) ? value : null)).catch(() => setGoal(null));
   refresh();
   const timer = setInterval(() => void refresh(), POLL_MS);
   onCleanup(() => clearInterval(timer));
@@ -102,11 +102,11 @@ function GoalSection(props) {
       _$setProp(_el$2, "justifyContent", "space-between");
       _$setProp(_el$2, "gap", 1);
       _$insertNode(_el$3, _$createTextNode(`Goal`));
-      _$insert(_el$5, () => `${current().status} \xB7 ${current().round}/${current().maxRounds}`);
+      _$insert(_el$5, () => `${current().status} \xB7 ${current().round}/${current().maxRounds ?? "\u221E"}`);
       _$insert(_el$6, () => `  ${shorten(current().text, 34)}`);
       _$insert(_el$, _$createComponent(Show, {
         get when() {
-          return _$memo(() => current().status === "paused")() && current().reason;
+          return _$memo(() => current().status !== "running")() && current().reason;
         },
         get children() {
           var _el$7 = _$createElement("text");

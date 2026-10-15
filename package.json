@@ -1,7 +1,7 @@
 {
   "name": "@c0dn/opencode-advisor",
   "version": "0.1.0",
-  "description": "OpenCode V2 plugin: an oracle_ask second-opinion tool, /advisor to pick its model, and /goal to keep working until the advisor judges a goal met.",
+  "description": "OpenCode V2 plugin: native advisor context, /advisor model selection, and unlimited-by-default /goal with background dependency waits.",
   "type": "module",
   "exports": {
     ".": {

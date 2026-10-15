@@ -2,7 +2,13 @@ import { parseModel, resolveAdvisorModel } from "./config.ts";
 import type { Host } from "./host.ts";
 import { lastTurnFailed, renderTranscript } from "./transcript.ts";
 
-export type GoalStatus = "running" | "paused" | "done" | "stopped";
+export type GoalStatus = "running" | "waiting" | "paused" | "done" | "stopped";
+
+export interface Dependency {
+  id: string;
+  kind: "shell" | "subagent";
+  since: number;
+}
 
 export interface Goal {
   sessionID: string;
@@ -10,12 +16,16 @@ export interface Goal {
   status: GoalStatus;
   /** Rounds judged so far; a round is one agent turn followed by one verdict. */
   round: number;
-  maxRounds: number;
+  /** null means unlimited; JSON-safe for persisted goals. */
+  maxRounds: number | null;
   started: number;
   /** The advisor's last few "missing" lists, newest last, for stall detection. */
   feedback: string[];
   /** Why the goal is paused, done or stopped. */
   reason?: string;
+  waiting?: { dependencies: Dependency[]; deadline: number };
+  /** Unique queued turn identity; survives restart and /goal resume during a wait. */
+  pendingTurn?: string;
 }
 
 export interface Verdict {
@@ -26,15 +36,16 @@ export interface Verdict {
   next: string;
 }
 
-export const DEFAULT_MAX_ROUNDS = 15;
+export const DEFAULT_MAX_ROUNDS = null;
 /** Identical feedback this many rounds in a row means the agent is going in circles. */
 const STALL_ROUNDS = 3;
 /** How long a resumed turn may take to start before the loop gives up. */
 const START_TIMEOUT_MS = 120_000;
 const POLL_MS = 1000;
+const WAIT_POLL_MS = 5000;
 
 const goalKey = (sessionID: string) => `goal:${sessionID}`;
-const active = new Set<string>();
+const controllers = new WeakMap<Host, Set<string>>();
 
 export async function loadGoal(host: Host, sessionID: string): Promise<Goal | undefined> {
   const value = await host.storage.get(goalKey(sessionID));
@@ -89,7 +100,7 @@ async function judge(host: Host, goal: Goal, messages: readonly unknown[]): Prom
 }
 
 function roundMarker(goal: Goal): string {
-  return `[goal round ${goal.round + 1}/${goal.maxRounds}]`;
+  return `[goal round ${goal.round + 1}/${goal.maxRounds ?? "∞"}]`;
 }
 
 function kickoffText(goal: Goal): string {
@@ -124,6 +135,7 @@ async function turnStarted(host: Host, sessionID: string, marker: string): Promi
 async function waitForTurn(host: Host, sessionID: string, marker: string): Promise<boolean> {
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    if (host.signal?.aborted) return false;
     if (await turnStarted(host, sessionID, marker)) {
       await host.wait(sessionID);
       return true;
@@ -147,14 +159,20 @@ function stalled(feedback: string[]): boolean {
 }
 
 /** Drives one goal until it is done, paused or stopped. One loop per session. */
-async function run(host: Host, sessionID: string, firstMarker?: string): Promise<void> {
+async function run(host: Host, sessionID: string): Promise<void> {
+  const active = controllers.get(host) ?? new Set<string>();
+  controllers.set(host, active);
   if (active.has(sessionID)) return;
   active.add(sessionID);
   try {
-    let marker = firstMarker;
     while (true) {
+      if (host.signal?.aborted) return;
+      const before = await loadGoal(host, sessionID);
+      if (!before || !["running", "waiting"].includes(before.status)) return;
+      const marker = before.pendingTurn;
       if (marker) {
         if (!(await waitForTurn(host, sessionID, marker))) {
+          if (host.signal?.aborted) return;
           const goal = await loadGoal(host, sessionID);
           if (goal?.status === "running") await pause(host, goal, "the agent's turn did not start");
           return;
@@ -162,16 +180,45 @@ async function run(host: Host, sessionID: string, firstMarker?: string): Promise
       } else {
         await host.wait(sessionID);
       }
+      if (host.signal?.aborted) return;
 
       const goal = await loadGoal(host, sessionID);
-      if (!goal || goal.status !== "running") return;
+      if (!goal || (goal.status !== "running" && goal.status !== "waiting")) return;
+      if (goal.pendingTurn !== marker) continue; // a new resume turn has not been observed yet
+      if (marker) {
+        goal.pendingTurn = undefined;
+        await saveGoal(host, goal);
+      }
+
+      if (goal.status === "waiting") {
+        if (!goal.waiting) return pause(host, goal, "waiting state has no dependencies; /goal resume to recover");
+        const messages = await host.context(sessionID);
+        const latest = await loadGoal(host, sessionID);
+        if (latest?.status !== "waiting" || JSON.stringify(latest.waiting) !== JSON.stringify(goal.waiting)) {
+          continue;
+        }
+        if (!dependenciesHandled(messages, goal.waiting.dependencies)) {
+          if (Date.now() >= goal.waiting.deadline) return pause(host, goal, "background wait expired; inspect the dependency, then /goal resume");
+          // Waiting checks do not call a model, spend rounds, or enqueue parent turns.
+          await Bun.sleep(Math.min(WAIT_POLL_MS, Math.max(1, goal.waiting.deadline - Date.now())));
+          continue;
+        }
+        goal.status = "running";
+        goal.waiting = undefined;
+        goal.reason = undefined;
+        await saveGoal(host, goal);
+        // Native completion owns waking the parent. Judge only after it handles it.
+        await host.wait(sessionID);
+      }
 
       const messages = await host.context(sessionID);
       if (lastTurnFailed(messages)) return pause(host, goal, "the last turn was interrupted or ended in an error");
 
       const verdict = await judge(host, goal, messages);
+      if (host.signal?.aborted) return;
       // A /goal stop while the advisor was thinking wins.
       const current = await loadGoal(host, sessionID);
+      if (current?.status === "waiting" || current?.pendingTurn) continue;
       if (!current || current.status !== "running") return;
       if (!verdict) return pause(host, current, "the advisor's verdict could not be parsed twice in a row");
 
@@ -185,44 +232,47 @@ async function run(host: Host, sessionID: string, firstMarker?: string): Promise
       if (verdict.blocked) return pause(host, current, `the agent is blocked: ${verdict.next || verdict.summary}`);
       current.feedback = [...current.feedback, verdict.missing.join(" | ")].slice(-STALL_ROUNDS);
       if (stalled(current.feedback)) return pause(host, current, `no progress for ${STALL_ROUNDS} rounds: ${verdict.missing.join("; ")}`);
-      if (current.round >= current.maxRounds) return pause(host, current, `reached the limit of ${current.maxRounds} rounds`);
+      if (current.maxRounds != null && current.round >= current.maxRounds) return pause(host, current, `reached the limit of ${current.maxRounds} rounds`);
 
-      await saveGoal(host, current);
-      marker = roundMarker(current);
-      await host.turn(sessionID, continueText(current, verdict));
+      await enqueueTurn(host, current, continueText(current, verdict));
     }
   } catch (error) {
+    if (host.signal?.aborted) return;
     const goal = await loadGoal(host, sessionID).catch(() => undefined);
-    if (goal?.status === "running") await pause(host, goal, `the goal loop failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (goal?.status === "running" || goal?.status === "waiting") await pause(host, goal, `the goal loop failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     active.delete(sessionID);
   }
 }
 
-export async function startGoal(host: Host, sessionID: string, text: string, maxRounds: number): Promise<void> {
+async function enqueueTurn(host: Host, goal: Goal, text: string): Promise<void> {
+  goal.pendingTurn = `[goal turn ${crypto.randomUUID()}]`;
+  await saveGoal(host, goal);
+  await host.turn(goal.sessionID, `${text}\n\n${goal.pendingTurn}`);
+}
+
+export async function startGoal(host: Host, sessionID: string, text: string, maxRounds: number | null = DEFAULT_MAX_ROUNDS): Promise<void> {
   const existing = await loadGoal(host, sessionID);
-  if (existing?.status === "running") {
+  if (existing?.status === "running" || existing?.status === "waiting") {
     throw new Error(`A goal is already running here: "${existing.text}". /goal stop it first.`);
   }
   const goal: Goal = { sessionID, text, status: "running", round: 0, maxRounds, started: Date.now(), feedback: [] };
-  await saveGoal(host, goal);
-  const marker = roundMarker(goal);
-  await host.turn(sessionID, kickoffText(goal));
-  void run(host, sessionID, marker);
+  await enqueueTurn(host, goal, kickoffText(goal));
+  void run(host, sessionID);
 }
 
 export async function resumeGoal(host: Host, sessionID: string, extraRounds?: number): Promise<Goal> {
   const goal = await loadGoal(host, sessionID);
   if (!goal || goal.status === "done" || goal.status === "stopped") throw new Error("No paused goal in this session.");
+  if (goal.status === "running") throw new Error("The goal is already running.");
   goal.status = "running";
   goal.reason = undefined;
+  goal.waiting = undefined;
   goal.feedback = [];
-  if (extraRounds) goal.maxRounds = goal.round + extraRounds;
-  else if (goal.round >= goal.maxRounds) goal.maxRounds = goal.round + DEFAULT_MAX_ROUNDS;
-  await saveGoal(host, goal);
+  goal.maxRounds = extraRounds === undefined ? DEFAULT_MAX_ROUNDS : goal.round + extraRounds;
   const marker = roundMarker(goal);
-  await host.turn(sessionID, `${marker} Resuming the goal. Continue from where you left off.\n\nGoal: ${goal.text}`);
-  void run(host, sessionID, marker);
+  await enqueueTurn(host, goal, `${marker} Resuming the goal. Continue from where you left off.\n\nGoal: ${goal.text}`);
+  void run(host, sessionID);
   return goal;
 }
 
@@ -239,6 +289,54 @@ export async function stopGoal(host: Host, sessionID: string): Promise<Goal | un
 export async function resumeRunningGoals(host: Host): Promise<void> {
   for (const { value } of await host.storage.scan("goal:")) {
     const goal = value as Goal;
-    if (goal?.status === "running") void run(host, goal.sessionID);
+    if (goal?.status === "running" || goal?.status === "waiting") void run(host, goal.sessionID);
   }
+}
+
+type EvidenceMessage = {
+  type?: string;
+  time?: { created?: number };
+  metadata?: { source?: string; shellID?: string; childID?: string; state?: string };
+  content?: { type?: string; name?: string; state?: { status?: string; metadata?: Record<string, unknown> } }[];
+};
+
+/** Only native, structured completion metadata counts; quoted XML never does. */
+export function dependenciesHandled(messages: readonly unknown[], dependencies: Dependency[]): boolean {
+  const rows = messages as EvidenceMessage[];
+  return dependencies.every((dep) => {
+    const at = rows.findLastIndex((m) => m.type === "synthetic" && m.metadata?.source === dep.kind
+      && (dep.kind === "shell" ? m.metadata.shellID : m.metadata.childID) === dep.id
+      && ["completed", "error", "cancelled"].includes(m.metadata.state ?? "")
+      && (m.time?.created ?? 0) >= dep.since);
+    return at >= 0 && rows.slice(at + 1).some((m) => m.type === "assistant");
+  });
+}
+
+/** Explicit dependencies, not every background process (a dev server may never exit). */
+export async function waitForDependencies(host: Host, sessionID: string, ids: string[], reason: string, timeoutSeconds = 86400): Promise<Goal> {
+  const goal = await loadGoal(host, sessionID);
+  if (!goal || (goal.status !== "running" && goal.status !== "waiting")) throw new Error("No running goal to wait. Start or resume /goal first.");
+  if (!ids.length || ids.length > 20 || !reason.trim()) throw new Error("Provide 1–20 dependency IDs and a reason.");
+  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 604800) throw new Error("timeoutSeconds must be 1–604800.");
+  const messages = await host.context(sessionID) as EvidenceMessage[];
+  const dependencies = [...new Set(ids)].map((id): Dependency => {
+    for (const m of [...messages].reverse()) {
+      for (const part of [...(m.content ?? [])].reverse()) {
+        const meta = part.state?.metadata;
+        if (m.type !== "assistant" || part.type !== "tool" || part.state?.status !== "completed" || meta?.status !== "running") continue;
+        if ((part.name === "shell" && meta.shellID === id) || (part.name === "subagent" && meta.sessionID === id)) {
+          if (!m.time?.created) throw new Error("Dependency launch timestamp is missing; cannot safely bind this wait.");
+          return { id, kind: part.name as Dependency["kind"], since: m.time.created };
+        }
+      }
+    }
+    throw new Error(`No native background launch for ${id} in this session's active context. Do not guess IDs.`);
+  });
+  goal.status = "waiting";
+  goal.pendingTurn = undefined; // this tool call proves the parent turn has started
+  goal.reason = reason.trim();
+  goal.waiting = { dependencies, deadline: Date.now() + timeoutSeconds * 1000 };
+  await saveGoal(host, goal);
+  void run(host, sessionID);
+  return goal;
 }

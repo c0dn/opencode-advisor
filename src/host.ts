@@ -31,4 +31,8 @@ export interface Host {
   project: string;
   /** This plugin's options from opencode.json. */
   options: Readonly<Record<string, unknown>>;
+  /** Host-state checks for waits; defaults to the real filesystem, /proc and systemctl. */
+  probe?: import("./probe.ts").Probe;
+  /** Interval between detached-job checks; default 30s. */
+  jobPollMs?: number;
 }

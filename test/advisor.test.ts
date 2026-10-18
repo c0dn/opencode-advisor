@@ -215,16 +215,27 @@ describe("/goal loop", () => {
     expect(await settle(host, "s1")).toMatchObject({ status: "done", round: 1 });
   }, 15000);
 
-  test("expired wait pauses without a model call; explicit resume overrides waiting", async () => {
-    const { host, messages, store, prompts } = fakeHost({ verdicts: [verdict({ done: true })] }); seed(store);
+  test("expired wait reconciles once without a model call, then pauses; explicit resume overrides waiting", async () => {
+    const { host, messages, store, prompts, notices } = fakeHost({ verdicts: [verdict({ missing: ["x"] })] }); seed(store);
+    const turns: string[] = [];
+    host.turn = async (_id, text) => { turns.push(text); };
     messages.push(launch("sh_train"));
     await waitForDependencies(host, "s1", ["sh_train"], "training", 1);
     await Bun.sleep(1100);
-    expect(await loadGoal(host, "s1")).toMatchObject({ status: "paused", round: 0 });
     expect(prompts).toHaveLength(0);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toContain("Reconcile background work");
+    expect(turns[0]).toContain("sh_train");
+    expect(notices.at(-1)).toContain("expired");
+    // The agent re-waits on the same dependency; a second expiry pauses.
+    messages.push({ type: "synthetic", text: turns[0] }, { type: "assistant", content: [] });
+    await waitForDependencies(host, "s1", ["sh_train"], "training again", 1);
+    expect(await settle(host, "s1")).toMatchObject({ status: "paused", round: 0 });
+    expect(prompts).toHaveLength(0);
+    host.turn = async (_id, text) => { messages.push({ type: "synthetic", text }, { type: "assistant", content: [] }); };
     await goalCommand(host, "s1", "resume");
-    expect(await settle(host, "s1")).toMatchObject({ status: "done" });
-  });
+    expect((await loadGoal(host, "s1"))?.reconciled).toBeUndefined();
+  }, 15000);
 
   test("wait survives controller restart and stop prevents later judgment", async () => {
     const { host, messages, store, prompts } = fakeHost(); seed(store);

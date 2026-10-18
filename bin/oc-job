@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# oc-job: launch a detached, restart-safe job for /goal waits.
+#   oc-job <name> <absolute-log> [--cwd DIR] -- <command...>
+# Runs the command as a transient systemd --user unit (oc-<name>.service) with stdin
+# from /dev/null and output appended to <log>. The wrapper appends EXIT=<rc> to the
+# log on exit or SIGTERM and preserves the exit status. Prints the goal_wait job
+# spec as JSON. Refuses to start while the unit is already active.
+set -euo pipefail
+
+usage() { echo "usage: oc-job <name> <absolute-log> [--cwd DIR] -- <command...>" >&2; exit 2; }
+[ $# -ge 4 ] || usage
+name=$1 log=$2; shift 2
+cwd=$PWD
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+  case $1 in
+    --cwd) cwd=${2:?--cwd needs a directory}; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ "${1:-}" = "--" ] || usage
+shift
+[ $# -gt 0 ] || usage
+
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$ ]] || { echo "oc-job: bad name: $name" >&2; exit 2; }
+[[ $log = /* ]] || { echo "oc-job: log must be an absolute path" >&2; exit 2; }
+mkdir -p "$(dirname "$log")"
+unit="oc-$name.service"
+
+if systemctl --user is-active -q "$unit"; then
+  echo "oc-job: $unit is already active; not starting a duplicate (log: $log)" >&2
+  exit 3
+fi
+systemctl --user reset-failed "$unit" 2>/dev/null || true
+
+# The wrapper runs inside the unit. The command runs in the background so SIGTERM
+# (systemctl stop) still records a marker before the unit exits.
+wrapper='
+log=$1; shift
+echo "oc-job start $(date -Is) cwd=$PWD cmd=$*" >>"$log"
+"$@" </dev/null >>"$log" 2>&1 &
+child=$!
+trap "kill -TERM $child 2>/dev/null; wait $child; echo EXIT=143 >>\"$log\"; exit 143" TERM INT
+wait $child; rc=$?
+echo "EXIT=$rc" >>"$log"
+exit $rc
+'
+
+systemd-run --user --quiet --collect --unit="$unit" --working-directory="$cwd" \
+  --property=StandardInput=null --property=KillMode=mixed \
+  --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+  ${VIRTUAL_ENV:+--setenv=VIRTUAL_ENV="$VIRTUAL_ENV"} \
+  ${CUDA_VISIBLE_DEVICES:+--setenv=CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"} \
+  /bin/bash -c "$wrapper" oc-job "$log" "$@"
+
+printf '{"name":"%s","log":"%s","unit":"%s"}\n' "$name" "$log" "$unit"

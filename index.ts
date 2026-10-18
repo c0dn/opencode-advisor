@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 
 import { advisorCommand, commandArgs, goalCommand } from "./src/commands.ts"
-import { loadGoal, resumeRunningGoals, waitForDependencies } from "./src/goal.ts"
+import { loadGoal, resumeRunningGoals, waitForDependencies, type JobInput } from "./src/goal.ts"
 import type { Host } from "./src/host.ts"
 import { installConsultations } from "./src/consultation.ts"
 import { Advisor } from "./src/rpc.ts"
@@ -75,22 +75,39 @@ export default Plugin.define({
       if (!goalEnabled) return
       draft.add({
         name: "goal_wait",
-        description: "Suspend /goal judging while waiting for native background shells or subagents. Call after launching dependencies, when no independent work remains, then end your turn. Native completion wakes you; do not duplicate their work. No goal rounds are spent waiting. Not for persistent dev servers or untracked terminals.",
+        description: "Suspend /goal judging while waiting for background work, then end your turn. ids: native background shell IDs or child sessionIDs from this session (short waits; native completion wakes you; lost if OpenCode restarts or drops the shell). jobs: detached work launched with the plugin's oc-job script, systemd-run or setsid (training, long evals); the plugin checks the log's EXIT= marker, unit or pid from host state, survives OpenCode restarts, and queues the result turn itself. A lost or expired dependency gets one reconcile turn. Do not poll or duplicate the work. Not for persistent dev servers.",
         input: {
           type: "object",
           properties: {
-            ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 20, description: "Shell IDs or child sessionIDs returned by this session's native background tools. Wait for all of them." },
+            ids: { type: "array", items: { type: "string" }, maxItems: 20, description: "Shell IDs or child sessionIDs returned by this session's native background tools. Wait for all of them." },
+            jobs: {
+              type: "array",
+              maxItems: 20,
+              description: "Detached jobs. Each finishes when its log's last marker line (default EXIT=<code>) appears, or is reported as ended when its unit/pid stops without one.",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string", description: "Short unique label, e.g. run3." },
+                  log: { type: "string", description: "Absolute path of the job's own log; the wrapper appends EXIT=<rc>." },
+                  unit: { type: "string", description: "systemd --user unit, e.g. oc-run3.service." },
+                  pid: { type: "integer", minimum: 1, description: "Process ID, for setsid/nohup jobs." },
+                  marker: { type: "string", description: "Exit marker prefix; default EXIT=." },
+                },
+                required: ["name", "log"],
+                additionalProperties: false,
+              },
+            },
             reason: { type: "string", minLength: 1 },
-            timeoutSeconds: { type: "integer", minimum: 1, maximum: 604800, description: "Wait deadline; default 86400 (24h). Expiry pauses the goal, never restarts duplicate work." },
+            timeoutSeconds: { type: "integer", minimum: 1, maximum: 2592000, description: "Wait deadline; default 86400 (24h). Max 7 days with native ids, 30 days for job-only waits. Expiry queues one reconcile turn, never restarts work." },
           },
-          required: ["ids", "reason"],
+          required: ["reason"],
           additionalProperties: false,
         },
         options: { codemode: false as const },
         async execute(input, toolContext) {
-          const args = input as { ids: string[]; reason: string; timeoutSeconds?: number }
-          await waitForDependencies(host, toolContext.sessionID, args.ids, args.reason, args.timeoutSeconds)
-          return { content: "Goal waiting. End your turn; native completion will return the dependency result. Do not poll or duplicate the background work. /goal resume overrides this wait; /goal stop stops the goal, not the jobs." }
+          const args = input as { ids?: string[]; jobs?: JobInput[]; reason: string; timeoutSeconds?: number }
+          await waitForDependencies(host, toolContext.sessionID, args.ids ?? [], args.reason, args.timeoutSeconds, args.jobs ?? [])
+          return { content: "Goal waiting. End your turn now. Native completions or the plugin's job check will wake you. Do not poll or duplicate the background work. /goal resume overrides this wait; /goal stop stops the goal, not the jobs." }
         },
       })
     })

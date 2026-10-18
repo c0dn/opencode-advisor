@@ -33,20 +33,47 @@ Goals survive an OpenCode restart. Round updates appear as toasts, and as a desk
 
 ## Waiting for background work
 
-When no independent work remains, call
-`goal_wait({ids: ["sh_…", "ses_…"], reason: "need training and research results"})`
-and end the turn. IDs must come from native background tool launches in the current
-session's active context. All listed dependencies must finish and their native
-completion messages must be followed by a parent assistant turn before judging
-resumes. Waiting uses no model calls or goal rounds and does not enqueue another
-parent turn. Failure and cancellation are evidence for the parent, not success.
+When no independent work remains, call `goal_wait` and end the turn. Waiting uses no
+model calls or goal rounds. Failure and cancellation are evidence for the parent, not
+success. There are two kinds of dependency.
 
-The default deadline is 24h (`timeoutSeconds`, up to 7 days). Expiry pauses the goal
-instead of starting duplicate work. `/goal resume` overrides a wait; `/goal stop`
-stops the goal without killing its jobs. Waits persist across plugin restarts. A
-missing/compacted completion leaves the goal waiting until its deadline or manual
-resume. Use a bounded native shell watcher for independently managed terminals;
-do not wait on a persistent dev server itself.
+**Native (`ids`)**, for short waits: shell IDs or child sessionIDs from background
+tool launches in this session, e.g.
+`goal_wait({ids: ["sh_…", "ses_…"], reason: "need test and research results"})`.
+Their native completion messages must be followed by a parent turn before judging
+resumes. They live inside the OpenCode server, so an OpenCode restart, or the server
+dropping a shell when it unloads an idle project, loses them silently.
+
+**Detached jobs (`jobs`)**, for training, long evals, anything that must outlive
+OpenCode. Launch with the bundled `bin/oc-job`, which runs the command as a transient
+`systemd --user` unit and appends `EXIT=<rc>` to the job's log on exit or stop:
+
+```sh
+oc-job run3 /abs/path/reports/run3.log -- python train.py --run 3
+# prints {"name":"run3","log":"/abs/path/reports/run3.log","unit":"oc-run3.service"}
+```
+
+then `goal_wait({jobs: [<that JSON>], reason: "run3 training"})`. Any detached job works
+if it writes its own log and a final marker line; give `unit` or `pid` too, so a job
+that dies without a marker is reported instead of waited on until the deadline. The
+plugin checks host state (last marker in the log tail, `systemctl --user` state, `/proc`
+start time to reject a reused PID) every 30 seconds. It queues the result turn itself,
+with each job's exit code and last log lines, and picks up jobs that finished while
+OpenCode was down. Jobs are local only: the plugin cannot see logs on another host.
+Use a fresh log per run for log-only jobs; with `unit`/`pid` a live process wins over
+an old marker. `oc-job` refuses to start a unit that is already active. To put it on
+`PATH`, symlink it from a checkout: `ln -s "$PWD/bin/oc-job" ~/.local/bin/oc-job`.
+
+**Lost and expired dependencies.** A native dependency is lost when a different
+OpenCode server process is running than the one that launched it, or when its shell
+output file disappears (after a 30s grace). A lost dependency, or one still open at the
+deadline, gets **one** reconcile turn telling the agent to check the real state before
+relaunching anything. If the same dependency is lost or expires again, the goal pauses.
+
+The default deadline is 24h (`timeoutSeconds`: up to 7 days with native ids, 30 days
+for job-only waits). `/goal resume` overrides a wait and resets the reconcile
+allowance; `/goal stop` stops the goal without killing its jobs. Waits persist across
+plugin and OpenCode restarts. Do not wait on a persistent dev server itself.
 
 ## Consultation boundaries
 
@@ -63,9 +90,9 @@ and approval-dependent actions. Use read/glob/grep and Jina retrieval; have the
 parent run authenticated CLI checks. Configure their agent permissions deny-first
 as well. No custom child runner, polling scheduler or log-monitor plugin is needed.
 
-Waiting checks run at most every five seconds without model calls. A completion
-delivered without native parent resumption deliberately remains waiting until the
-parent handles it or the deadline pauses the goal. Common credential paths are
+Waiting checks run at most every five seconds without model calls. A native
+completion delivered without parent resumption deliberately remains waiting until the
+parent handles it or the deadline queues a reconcile turn. Common credential paths are
 denied, but read/search access is not an OS sandbox; do not use these roles for
 untrusted agents. `src/oracle.ts` is retained as an unregistered legacy helper
 and regression fixture, not exposed as a tool.
@@ -85,7 +112,7 @@ Telling the agent when to use it helps. For example, in `AGENTS.md`:
 ```md
 - Call native `advisor` for consequential uncertainty, repeated failures or independent
   verification; use foreground for blocking decisions, background for independent work.
-- Call `goal_wait` before ending a goal turn solely to await native background dependencies.
+- Call `goal_wait` before ending a goal turn solely to await background work: `ids` for native shells or subagents, `jobs` (launched with `oc-job`) for anything long or restart-sensitive.
 - A message starting `[goal round N/M]` comes from `/goal`: keep working and show verifiable evidence.
 ```
 

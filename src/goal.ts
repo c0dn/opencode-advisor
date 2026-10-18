@@ -1,13 +1,44 @@
+import { dirname, isAbsolute } from "node:path";
+
 import { parseModel, resolveAdvisorModel } from "./config.ts";
 import type { Host } from "./host.ts";
+import { hostProbe, type Probe } from "./probe.ts";
 import { lastTurnFailed, renderTranscript } from "./transcript.ts";
 
 export type GoalStatus = "running" | "waiting" | "paused" | "done" | "stopped";
 
-export interface Dependency {
+/** A native background shell or subagent; OpenCode delivers its completion message. */
+export interface NativeDependency {
   id: string;
   kind: "shell" | "subagent";
   since: number;
+  /** OpenCode server that launched it; a different server means the dependency died with the old one. */
+  server?: string;
+  /** Shell output file; OpenCode removes it when it drops the shell. */
+  file?: string;
+}
+
+/** A detached job (systemd unit, setsid process) checked through host state, not OpenCode events. */
+export interface JobDependency {
+  id: string;
+  kind: "job";
+  since: number;
+  log: string;
+  unit?: string;
+  pid?: number;
+  /** Kernel start time of `pid`, so a reused PID is not mistaken for the job. */
+  start?: string;
+  marker: string;
+}
+
+export type Dependency = NativeDependency | JobDependency;
+
+export interface JobInput {
+  name: string;
+  log: string;
+  unit?: string;
+  pid?: number;
+  marker?: string;
 }
 
 export interface Goal {
@@ -26,6 +57,8 @@ export interface Goal {
   waiting?: { dependencies: Dependency[]; deadline: number };
   /** Unique queued turn identity; survives restart and /goal resume during a wait. */
   pendingTurn?: string;
+  /** Dependencies already given a reconcile turn; a second loss or expiry pauses instead. */
+  reconciled?: string[];
 }
 
 export interface Verdict {
@@ -43,6 +76,12 @@ const STALL_ROUNDS = 3;
 const START_TIMEOUT_MS = 120_000;
 const POLL_MS = 1000;
 const WAIT_POLL_MS = 5000;
+/** Default interval between host checks of detached jobs (systemctl, /proc, log tail). */
+const JOB_POLL_MS = 30_000;
+/** A shell output file may not exist yet right after launch. */
+const LOST_GRACE_MS = 30_000;
+const NATIVE_MAX_SECONDS = 604800;
+const JOB_MAX_SECONDS = 30 * 86400;
 
 const goalKey = (sessionID: string) => `goal:${sessionID}`;
 const controllers = new WeakMap<Host, Set<string>>();
@@ -193,14 +232,38 @@ async function run(host: Host, sessionID: string): Promise<void> {
       if (goal.status === "waiting") {
         if (!goal.waiting) return pause(host, goal, "waiting state has no dependencies; /goal resume to recover");
         const messages = await host.context(sessionID);
+        const states = await dependencyStates(host, sessionID, messages, goal.waiting.dependencies);
         const latest = await loadGoal(host, sessionID);
         if (latest?.status !== "waiting" || JSON.stringify(latest.waiting) !== JSON.stringify(goal.waiting)) {
           continue;
         }
-        if (!dependenciesHandled(messages, goal.waiting.dependencies)) {
-          if (Date.now() >= goal.waiting.deadline) return pause(host, goal, "background wait expired; inspect the dependency, then /goal resume");
+        const done = new Set(goal.reconciled ?? []);
+        const lost = states.filter((s) => s.state === "lost");
+        if (lost.length) {
+          if (lost.some((s) => done.has(s.dep.id))) {
+            return pause(host, goal, `dependency lost again (${lost.map((s) => s.dep.id).join(", ")}); inspect it, then /goal resume`);
+          }
+          await reconcile(host, goal, lost, "lost");
+          continue;
+        }
+        const open = states.filter((s) => s.state === "pending" || s.state === "running");
+        if (open.length) {
+          if (Date.now() >= goal.waiting.deadline) {
+            if (open.some((s) => done.has(s.dep.id))) return pause(host, goal, "background wait expired; inspect the dependency, then /goal resume");
+            await reconcile(host, goal, open, "expired");
+            continue;
+          }
           // Waiting checks do not call a model, spend rounds, or enqueue parent turns.
-          await Bun.sleep(Math.min(WAIT_POLL_MS, Math.max(1, goal.waiting.deadline - Date.now())));
+          const tick = goal.waiting.dependencies.some((d) => d.kind === "job") ? Math.min(WAIT_POLL_MS, host.jobPollMs ?? JOB_POLL_MS) : WAIT_POLL_MS;
+          await Bun.sleep(Math.min(tick, Math.max(1, goal.waiting.deadline - Date.now())));
+          continue;
+        }
+        if (states.some((s) => s.dep.kind === "job")) {
+          // No native completion exists for detached jobs: this plugin owns waking the parent.
+          goal.status = "running";
+          goal.waiting = undefined;
+          goal.reason = undefined;
+          await enqueueTurn(host, goal, jobResultText(goal, states));
           continue;
         }
         goal.status = "running";
@@ -268,6 +331,7 @@ export async function resumeGoal(host: Host, sessionID: string, extraRounds?: nu
   goal.status = "running";
   goal.reason = undefined;
   goal.waiting = undefined;
+  goal.reconciled = undefined;
   goal.feedback = [];
   goal.maxRounds = extraRounds === undefined ? DEFAULT_MAX_ROUNDS : goal.round + extraRounds;
   const marker = roundMarker(goal);
@@ -297,45 +361,200 @@ type EvidenceMessage = {
   type?: string;
   time?: { created?: number };
   metadata?: { source?: string; shellID?: string; childID?: string; state?: string };
-  content?: { type?: string; name?: string; state?: { status?: string; metadata?: Record<string, unknown> } }[];
+  content?: { type?: string; name?: string; content?: { type?: string; text?: string }[]; state?: { status?: string; metadata?: Record<string, unknown>; content?: { type?: string; text?: string }[] } }[];
 };
 
-/** Only native, structured completion metadata counts; quoted XML never does. */
-export function dependenciesHandled(messages: readonly unknown[], dependencies: Dependency[]): boolean {
-  const rows = messages as EvidenceMessage[];
-  return dependencies.every((dep) => {
-    const at = rows.findLastIndex((m) => m.type === "synthetic" && m.metadata?.source === dep.kind
-      && (dep.kind === "shell" ? m.metadata.shellID : m.metadata.childID) === dep.id
-      && ["completed", "error", "cancelled"].includes(m.metadata.state ?? "")
-      && (m.time?.created ?? 0) >= dep.since);
-    return at >= 0 && rows.slice(at + 1).some((m) => m.type === "assistant");
-  });
+const probeOf = (host: Host): Probe => host.probe ?? hostProbe;
+
+/** True once a native completion for `dep` arrived after its launch and the parent has handled it. */
+function nativeHandled(rows: EvidenceMessage[], dep: NativeDependency): boolean {
+  const at = rows.findLastIndex((m) => m.type === "synthetic" && m.metadata?.source === dep.kind
+    && (dep.kind === "shell" ? m.metadata.shellID : m.metadata.childID) === dep.id
+    && ["completed", "error", "cancelled"].includes(m.metadata.state ?? "")
+    && (m.time?.created ?? 0) >= dep.since);
+  return at >= 0 && rows.slice(at + 1).some((m) => m.type === "assistant");
 }
 
+/** Only native, structured completion metadata counts; quoted XML never does. Jobs are not native. */
+export function dependenciesHandled(messages: readonly unknown[], dependencies: Dependency[]): boolean {
+  const rows = messages as EvidenceMessage[];
+  return dependencies.every((dep) => dep.kind !== "job" && nativeHandled(rows, dep));
+}
+
+export type DependencyState =
+  | { dep: Dependency; state: "handled" | "pending" | "running" }
+  | { dep: Dependency; state: "lost"; why: string }
+  | { dep: JobDependency; state: "exited"; code: number; tail: string }
+  | { dep: JobDependency; state: "ended"; why: string; tail: string };
+
+/** Last `marker<int>` line of a log tail. */
+export function exitMarker(text: string, marker: string): number | undefined {
+  let code: number | undefined;
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (t.startsWith(marker)) {
+      const m = /^(-?\d+)\s*$/.exec(t.slice(marker.length));
+      if (m) code = Number(m[1]);
+    }
+  }
+  return code;
+}
+
+const TAIL_BYTES = 16384;
+function tailLines(probe: Probe, path: string, lines = 20): string {
+  return probe.read(path, TAIL_BYTES).split("\n").filter((l, i, all) => l || i < all.length - 1)
+    .slice(-lines).map((l) => (l.length > 300 ? `${l.slice(0, 300)}…` : l)).join("\n");
+}
+
+const RUNNING_UNIT = new Set(["active", "activating", "reloading", "deactivating", "refreshing"]);
+
+/** Host facts, not events: survives OpenCode restarts and shell evictions. A live process wins over a stale marker. */
+export async function jobState(probe: Probe, dep: JobDependency): Promise<DependencyState> {
+  let alive: boolean | undefined;
+  if (dep.unit) {
+    const state = await probe.unitState(dep.unit);
+    if (state !== undefined) alive = RUNNING_UNIT.has(state);
+  }
+  if (alive === undefined && dep.pid !== undefined) {
+    const start = probe.processStart(dep.pid);
+    alive = start !== undefined && (dep.start === undefined || start === dep.start);
+  }
+  if (alive) return { dep, state: "running" };
+  const tail = tailLines(probe, dep.log);
+  const code = exitMarker(probe.read(dep.log, TAIL_BYTES), dep.marker);
+  if (code !== undefined) return { dep, state: "exited", code, tail };
+  if (alive === false) {
+    return { dep, state: "ended", why: `${dep.unit ? `unit ${dep.unit}` : `pid ${dep.pid}`} is no longer running and ${dep.log} has no ${dep.marker} marker`, tail };
+  }
+  return { dep, state: "running" };
+}
+
+function nativeState(probe: Probe, rows: EvidenceMessage[], dep: NativeDependency): DependencyState {
+  if (nativeHandled(rows, dep)) return { dep, state: "handled" };
+  const completed = rows.some((m) => m.type === "synthetic" && m.metadata?.source === dep.kind
+    && (dep.kind === "shell" ? m.metadata.shellID : m.metadata.childID) === dep.id && (m.time?.created ?? 0) >= dep.since);
+  if (completed) return { dep, state: "pending" }; // delivered; the parent has not handled it yet
+  if (dep.server && dep.server !== probe.serverID()) {
+    return { dep, state: "lost", why: "OpenCode restarted after it launched, so its native completion will never arrive" };
+  }
+  if (dep.kind === "shell" && dep.file && Date.now() - dep.since > LOST_GRACE_MS && !probe.exists(dep.file)) {
+    return { dep, state: "lost", why: `OpenCode dropped the shell (its output file ${dep.file} is gone), so no completion will arrive` };
+  }
+  return { dep, state: "running" };
+}
+
+const jobChecks = new WeakMap<Host, Map<string, { at: number; key: string; states: Map<string, DependencyState> }>>();
+
+async function dependencyStates(host: Host, sessionID: string, messages: readonly unknown[], deps: Dependency[]): Promise<DependencyState[]> {
+  const probe = probeOf(host);
+  const rows = messages as EvidenceMessage[];
+  const cache = jobChecks.get(host) ?? new Map();
+  jobChecks.set(host, cache);
+  const key = `${sessionID}:${JSON.stringify(deps)}`;
+  let entry = cache.get(sessionID);
+  const interval = host.jobPollMs ?? JOB_POLL_MS;
+  if (deps.some((d) => d.kind === "job") && (!entry || entry.key !== key || Date.now() - entry.at >= interval)) {
+    const states = new Map<string, DependencyState>();
+    for (const dep of deps) if (dep.kind === "job") states.set(dep.id, await jobState(probe, dep));
+    entry = { at: Date.now(), key, states };
+    cache.set(sessionID, entry);
+  }
+  return deps.map((dep) => dep.kind === "job" ? entry!.states.get(dep.id)! : nativeState(probe, rows, dep));
+}
+
+function jobResultText(goal: Goal, states: DependencyState[]): string {
+  const blocks = states.filter((s) => s.dep.kind === "job").map((s) => {
+    const dep = s.dep as JobDependency;
+    const head = s.state === "exited" ? `exited with code ${s.code}` : s.state === "ended" ? `ENDED WITHOUT A MARKER: ${s.why}` : s.state;
+    const tail = "tail" in s && s.tail ? `\nLast lines of ${dep.log}:\n${s.tail}` : `\nLog: ${dep.log}`;
+    return `- ${dep.id}: ${head}${tail}`;
+  });
+  return `${roundMarker(goal)} Background jobs finished (checked from host state by the goal plugin).
+
+Goal: ${goal.text}
+
+${blocks.join("\n\n")}
+
+Verify the results and artifacts, then continue toward the goal.`.slice(0, 8000);
+}
+
+async function reconcile(host: Host, goal: Goal, states: DependencyState[], cause: "lost" | "expired"): Promise<void> {
+  goal.reconciled = [...new Set([...(goal.reconciled ?? []), ...states.map((s) => s.dep.id)])];
+  goal.status = "running";
+  goal.waiting = undefined;
+  goal.reason = undefined;
+  const lines = states.map((s) => `- ${s.dep.id} (${s.dep.kind}): ${s.state === "lost" ? s.why : `still ${s.state} at the deadline`}${s.dep.kind === "job" ? `; log ${s.dep.log}` : ""}`);
+  await host.notify(goal.sessionID, `Goal wait ${cause === "lost" ? "lost a dependency" : "expired"}; queued one reconcile turn.`);
+  await enqueueTurn(host, goal, `${roundMarker(goal)} Reconcile background work: the goal wait ${cause === "lost" ? "lost a dependency" : "reached its deadline"}.
+
+Goal: ${goal.text}
+
+${lines.join("\n")}
+
+Check the real state before acting: job logs and EXIT= markers, systemd units, live processes, GPU use and artifacts.
+Do not relaunch anything unless the evidence shows it is gone and unfinished. If work is still running,
+wait on it again with goal_wait (prefer jobs: for detached work); if it finished, report and continue.
+A second loss or expiry of the same dependency pauses the goal.`);
+}
+
+const JOB_NAME = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/;
+
 /** Explicit dependencies, not every background process (a dev server may never exit). */
-export async function waitForDependencies(host: Host, sessionID: string, ids: string[], reason: string, timeoutSeconds = 86400): Promise<Goal> {
+export async function waitForDependencies(host: Host, sessionID: string, ids: string[], reason: string, timeoutSeconds = 86400, jobs: JobInput[] = []): Promise<Goal> {
   const goal = await loadGoal(host, sessionID);
   if (!goal || (goal.status !== "running" && goal.status !== "waiting")) throw new Error("No running goal to wait. Start or resume /goal first.");
-  if (!ids.length || ids.length > 20 || !reason.trim()) throw new Error("Provide 1–20 dependency IDs and a reason.");
-  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 604800) throw new Error("timeoutSeconds must be 1–604800.");
+  const total = new Set(ids).size + jobs.length;
+  if (!total || total > 20 || !reason.trim()) throw new Error("Provide 1–20 dependencies (ids and/or jobs) and a reason.");
+  const max = ids.length ? NATIVE_MAX_SECONDS : JOB_MAX_SECONDS;
+  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > max) {
+    throw new Error(`timeoutSeconds must be 1–${max}${ids.length ? " with native ids (job-only waits allow 30 days)" : ""}.`);
+  }
+  const probe = probeOf(host);
+  const server = probe.serverID();
   const messages = await host.context(sessionID) as EvidenceMessage[];
-  const dependencies = [...new Set(ids)].map((id): Dependency => {
+  const native = [...new Set(ids)].map((id): Dependency => {
     for (const m of [...messages].reverse()) {
       for (const part of [...(m.content ?? [])].reverse()) {
         const meta = part.state?.metadata;
         if (m.type !== "assistant" || part.type !== "tool" || part.state?.status !== "completed" || meta?.status !== "running") continue;
         if ((part.name === "shell" && meta.shellID === id) || (part.name === "subagent" && meta.sessionID === id)) {
           if (!m.time?.created) throw new Error("Dependency launch timestamp is missing; cannot safely bind this wait.");
-          return { id, kind: part.name as Dependency["kind"], since: m.time.created };
+          const text = (part.state?.content ?? part.content ?? []).map((c) => c.text ?? "").join("\n");
+          const file = part.name === "shell" ? /Output is streaming to: (\S+\.out)/.exec(text)?.[1] : undefined;
+          return { id, kind: part.name as NativeDependency["kind"], since: m.time.created, server, ...(file ? { file } : {}) };
         }
       }
     }
     throw new Error(`No native background launch for ${id} in this session's active context. Do not guess IDs.`);
   });
+  const names = new Set<string>();
+  const detached: JobDependency[] = [];
+  for (const job of jobs) {
+    if (!JOB_NAME.test(job.name ?? "") || names.has(job.name)) throw new Error(`Job name "${job.name}" must be unique, 1–64 chars of [A-Za-z0-9._@-].`);
+    names.add(job.name);
+    if (!isAbsolute(job.log ?? "") || !probe.exists(dirname(job.log))) throw new Error(`Job ${job.name}: log must be an absolute path in an existing directory.`);
+    const marker = job.marker ?? "EXIT=";
+    if (!marker.trim()) throw new Error(`Job ${job.name}: marker must not be empty.`);
+    const dep: JobDependency = { id: job.name, kind: "job", since: Date.now(), log: job.log, marker };
+    if (job.unit !== undefined) {
+      if (!/^[A-Za-z0-9:_.@\\-]+$/.test(job.unit)) throw new Error(`Job ${job.name}: invalid unit name.`);
+      dep.unit = job.unit;
+    }
+    if (job.pid !== undefined) {
+      if (!Number.isInteger(job.pid) || job.pid < 1) throw new Error(`Job ${job.name}: pid must be a positive integer.`);
+      dep.pid = job.pid;
+      const start = probe.processStart(job.pid);
+      if (start !== undefined) dep.start = start;
+    }
+    // Fail fast on a typo: a job that is neither running nor finished can only time out.
+    const state = await jobState(probe, dep);
+    if (state.state === "ended") throw new Error(`Job ${job.name}: ${state.why}. Check the unit/pid/log before waiting on it.`);
+    detached.push(dep);
+  }
   goal.status = "waiting";
   goal.pendingTurn = undefined; // this tool call proves the parent turn has started
   goal.reason = reason.trim();
-  goal.waiting = { dependencies, deadline: Date.now() + timeoutSeconds * 1000 };
+  goal.waiting = { dependencies: [...native, ...detached], deadline: Date.now() + timeoutSeconds * 1000 };
   await saveGoal(host, goal);
   void run(host, sessionID);
   return goal;

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # oc-job: launch a detached, restart-safe job for /goal waits.
 #   oc-job <name> <absolute-log> [--cwd DIR] -- <command...>
-# Runs the command as a transient systemd --user unit (oc-<name>.service) with stdin
-# from /dev/null and output appended to <log>. The wrapper appends EXIT=<rc> to the
-# log on exit or SIGTERM and preserves the exit status. Prints the goal_wait job
-# spec as JSON. Refuses to start while the unit is already active.
+# With systemd --user (Linux), runs the command as a transient unit (oc-<name>.service).
+# Elsewhere (macOS), runs it as a detached session leader tracked by a pidfile.
+# Stdin is /dev/null and output is appended to <log>. The wrapper appends EXIT=<rc> to
+# the log on exit or SIGTERM and preserves the exit status. Prints the goal_wait job
+# spec as JSON. Refuses to start while the same job is already running (exit 3).
 set -euo pipefail
 
 usage() { echo "usage: oc-job <name> <absolute-log> [--cwd DIR] -- <command...>" >&2; exit 2; }
@@ -24,19 +25,12 @@ shift
 [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$ ]] || { echo "oc-job: bad name: $name" >&2; exit 2; }
 [[ $log = /* ]] || { echo "oc-job: log must be an absolute path" >&2; exit 2; }
 mkdir -p "$(dirname "$log")"
-unit="oc-$name.service"
 
-if systemctl --user is-active -q "$unit"; then
-  echo "oc-job: $unit is already active; not starting a duplicate (log: $log)" >&2
-  exit 3
-fi
-systemctl --user reset-failed "$unit" 2>/dev/null || true
-
-# The wrapper runs inside the unit. The command runs in the background so SIGTERM
-# (systemctl stop) still records a marker before the unit exits.
+# The wrapper runs detached. The command runs in the background so SIGTERM still
+# records a marker before the wrapper exits.
 wrapper='
 log=$1; shift
-echo "oc-job start $(date -Is) cwd=$PWD cmd=$*" >>"$log"
+echo "oc-job start $(date -u +%Y-%m-%dT%H:%M:%SZ) cwd=$PWD cmd=$*" >>"$log"
 "$@" </dev/null >>"$log" 2>&1 &
 child=$!
 trap "kill -TERM $child 2>/dev/null; wait $child; echo EXIT=143 >>\"$log\"; exit 143" TERM INT
@@ -45,11 +39,49 @@ echo "EXIT=$rc" >>"$log"
 exit $rc
 '
 
-systemd-run --user --quiet --collect --unit="$unit" --working-directory="$cwd" \
-  --property=StandardInput=null --property=KillMode=mixed \
-  --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
-  ${VIRTUAL_ENV:+--setenv=VIRTUAL_ENV="$VIRTUAL_ENV"} \
-  ${CUDA_VISIBLE_DEVICES:+--setenv=CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"} \
-  /bin/bash -c "$wrapper" oc-job "$log" "$@"
+if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  unit="oc-$name.service"
+  if systemctl --user is-active -q "$unit"; then
+    echo "oc-job: $unit is already active; not starting a duplicate (log: $log)" >&2
+    exit 3
+  fi
+  systemctl --user reset-failed "$unit" 2>/dev/null || true
 
-printf '{"name":"%s","log":"%s","unit":"%s"}\n' "$name" "$log" "$unit"
+  systemd-run --user --quiet --collect --unit="$unit" --working-directory="$cwd" \
+    --property=StandardInput=null --property=KillMode=mixed \
+    --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+    ${VIRTUAL_ENV:+--setenv=VIRTUAL_ENV="$VIRTUAL_ENV"} \
+    ${CUDA_VISIBLE_DEVICES:+--setenv=CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"} \
+    /bin/bash -c "$wrapper" oc-job "$log" "$@"
+
+  printf '{"name":"%s","log":"%s","unit":"%s"}\n' "$name" "$log" "$unit"
+  exit 0
+fi
+
+# No user systemd: detach with setsid (through perl, which macOS ships) and track the
+# wrapper by pid plus start time, so a reused pid is not mistaken for the job.
+command -v perl >/dev/null 2>&1 || { echo "oc-job: needs systemd --user or perl" >&2; exit 1; }
+[ -d "$cwd" ] || { echo "oc-job: no such directory: $cwd" >&2; exit 2; }
+started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//'; }
+state=${XDG_STATE_HOME:-$HOME/.local/state}/oc-job
+mkdir -p "$state"
+pidfile=$state/$name.pid
+
+if [ -s "$pidfile" ]; then
+  read -r oldpid oldstart <"$pidfile" || true
+  if [ -n "${oldpid:-}" ] && [ -n "${oldstart:-}" ] && [ "$(started "$oldpid")" = "$oldstart" ]; then
+    echo "oc-job: $name is already running as pid $oldpid; not starting a duplicate (log: $log)" >&2
+    exit 3
+  fi
+fi
+
+pid=$(cd "$cwd" && perl -MPOSIX -e '
+  my $pid = fork() // die "oc-job: fork: $!\n";
+  if ($pid) { print "$pid\n"; exit 0 }
+  POSIX::setsid();
+  open STDIN, "<", "/dev/null"; open STDOUT, ">", "/dev/null"; open STDERR, ">&", \*STDOUT;
+  exec { $ARGV[0] } @ARGV or die "oc-job: exec: $!\n";
+' /bin/bash -c "$wrapper" oc-job "$log" "$@")
+printf '%s %s\n' "$pid" "$(started "$pid")" >"$pidfile"
+
+printf '{"name":"%s","log":"%s","pid":%s}\n' "$name" "$log" "$pid"

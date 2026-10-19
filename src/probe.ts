@@ -16,10 +16,24 @@ export interface Probe {
 }
 
 function processStart(pid: number): string | undefined {
+  if (process.platform !== "linux") return psStart(pid);
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     // Field 22 (starttime) follows the parenthesised command, which may contain spaces.
     return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+}
+
+/** No /proc (macOS, BSD): `ps` start time, normalised the same way as bin/oc-job's pidfile. */
+function psStart(pid: number): string | undefined {
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env, LC_ALL: "C" }, timeout: 5000,
+    });
+    const start = proc.stdout.toString().trim().replace(/\s+/g, " ");
+    return proc.exitCode === 0 && start ? start : undefined;
   } catch {
     return undefined;
   }

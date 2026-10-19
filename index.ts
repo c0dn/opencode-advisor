@@ -75,7 +75,7 @@ export default Plugin.define({
       if (!goalEnabled) return
       draft.add({
         name: "goal_wait",
-        description: "Suspend /goal judging while waiting for background work, then end your turn. ids: native background shell IDs or child sessionIDs from this session (short waits; native completion wakes you; lost if OpenCode restarts or drops the shell). jobs: detached work launched with the plugin's oc-job script, systemd-run or setsid (training, long evals); the plugin checks the log's EXIT= marker, unit or pid from host state, survives OpenCode restarts, and queues the result turn itself. A lost or expired dependency gets one reconcile turn. Do not poll or duplicate the work. Not for persistent dev servers.",
+        description: "Suspend /goal judging while waiting for background work, then end your turn. ids: native background shell IDs or child sessionIDs from this session (short waits; native completion wakes you; lost if OpenCode restarts or drops the shell). jobs: detached work launched with the plugin's oc-job script (systemd --user unit, or a pid on macOS), systemd-run or setsid (training, long evals); the plugin checks the log's EXIT= marker, unit or pid from host state, survives OpenCode restarts, and queues the result turn itself. A lost or expired dependency gets one reconcile turn. Do not poll or duplicate the work. Not for persistent dev servers.",
         input: {
           type: "object",
           properties: {

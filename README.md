@@ -46,22 +46,25 @@ dropping a shell when it unloads an idle project, loses them silently.
 
 **Detached jobs (`jobs`)**, for training, long evals, anything that must outlive
 OpenCode. Launch with the bundled `bin/oc-job`, which runs the command as a transient
-`systemd --user` unit and appends `EXIT=<rc>` to the job's log on exit or stop:
+`systemd --user` unit (or, without user systemd, e.g. on macOS, as a detached session
+leader) and appends `EXIT=<rc>` to the job's log on exit or stop:
 
 ```sh
 oc-job run3 /abs/path/reports/run3.log -- python train.py --run 3
 # prints {"name":"run3","log":"/abs/path/reports/run3.log","unit":"oc-run3.service"}
+# macOS: {"name":"run3","log":"/abs/path/reports/run3.log","pid":12345}
 ```
 
 then `goal_wait({jobs: [<that JSON>], reason: "run3 training"})`. Any detached job works
 if it writes its own log and a final marker line; give `unit` or `pid` too, so a job
 that dies without a marker is reported instead of waited on until the deadline. The
-plugin checks host state (last marker in the log tail, `systemctl --user` state, `/proc`
-start time to reject a reused PID) every 30 seconds. It queues the result turn itself,
+plugin checks host state (last marker in the log tail, `systemctl --user` state, process
+start time from `/proc` or `ps` to reject a reused PID) every 30 seconds. It queues the result turn itself,
 with each job's exit code and last log lines, and picks up jobs that finished while
 OpenCode was down. Jobs are local only: the plugin cannot see logs on another host.
 Use a fresh log per run for log-only jobs; with `unit`/`pid` a live process wins over
-an old marker. `oc-job` refuses to start a unit that is already active. To put it on
+an old marker. `oc-job` refuses to start a job that is already running (exit 3; on
+macOS it tracks the job in `~/.local/state/oc-job/<name>.pid`). To put it on
 `PATH`, symlink it from a checkout: `ln -s "$PWD/bin/oc-job" ~/.local/bin/oc-job`.
 
 **Lost and expired dependencies.** A native dependency is lost when a different

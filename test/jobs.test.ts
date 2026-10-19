@@ -96,7 +96,10 @@ describe("job state from host facts", () => {
   });
 
   test("the real probe sees this process and reads tails", () => {
-    expect(hostProbe.processStart(process.pid)).toMatch(/^\d+$/);
+    const start = hostProbe.processStart(process.pid);
+    if (process.platform === "linux") expect(start).toMatch(/^\d+$/);
+    else expect(start).toMatch(/^\w{3} \w{3} +\d+ [\d:]+ \d{4}$/);
+    expect(hostProbe.processStart(process.pid)).toBe(start!);
     expect(hostProbe.processStart(2 ** 22 + 7)).toBeUndefined();
     const d = dir(); const log = join(d, "t.log"); writeFileSync(log, "x".repeat(100) + "\nEXIT=5\n");
     expect(hostProbe.read(log, 8)).toBe("\nEXIT=5\n");

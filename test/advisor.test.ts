@@ -5,6 +5,8 @@ import { parseModel } from "../src/config.ts";
 import { dependenciesHandled, loadGoal, parseVerdict, resumeRunningGoals, waitForDependencies } from "../src/goal.ts";
 import type { Host, ModelRef } from "../src/host.ts";
 import { askOracle } from "../src/oracle.ts";
+import { completeGoal } from "../src/goal.ts";
+import { advisorEnabled } from "../src/config.ts";
 import { lastTurnFailed, renderTranscript } from "../src/transcript.ts";
 
 type Message = Record<string, unknown>;
@@ -51,6 +53,52 @@ function fakeHost(options: { verdicts?: string[]; turn?: () => Message } = {}) {
 }
 
 const verdict = (v: object) => JSON.stringify({ done: false, blocked: false, summary: "", missing: [], next: "", ...v });
+
+test("advisor on/off preserves model and project overrides global; reset inherits", async () => {
+  const { host } = fakeHost();
+  await advisorCommand(host, "provider/model");
+  await advisorCommand(host, "off --global");
+  expect(await advisorEnabled(host)).toEqual({ enabled: false, source: "global" });
+  expect(await advisorCommand(host, "")).toContain("provider/model");
+  await advisorCommand(host, "on");
+  expect((await advisorEnabled(host)).enabled).toBe(true);
+  const other = { ...host, project: "/other" };
+  expect((await advisorEnabled(other)).enabled).toBe(false);
+  await advisorCommand(host, "reset");
+  expect((await advisorEnabled(host)).enabled).toBe(false);
+});
+
+test("judge-free goal completes through tool without generating a verdict", async () => {
+  const { host, messages, prompts } = fakeHost();
+  host.options = { external_judge: false };
+  host.turn = async (_id, text) => {
+    messages.push({ type: "synthetic", text });
+    expect(text).toContain("goal_complete");
+    await completeGoal(host, "s1", "Implemented", "Tests passed");
+    messages.push({ type: "assistant", content: [] });
+  };
+  await goalCommand(host, "s1", "test");
+  expect((await loadGoal(host, "s1"))?.status).toBe("done");
+  expect(prompts).toHaveLength(0);
+});
+
+test("judge-free continuation respects round limit without advisor calls", async () => {
+  const { host, prompts } = fakeHost();
+  host.options = { external_judge: false };
+  await goalCommand(host, "s1", "-n 2 test");
+  expect(await settle(host, "s1")).toMatchObject({ status: "paused", round: 2 });
+  expect(prompts).toHaveLength(0);
+});
+
+test("completion rejects judged, inactive, blank and waiting goals", async () => {
+  const { host, store } = fakeHost();
+  await expect(completeGoal(host, "s1", "ok", "tests")).rejects.toThrow("external_judge");
+  host.options = { external_judge: false };
+  await expect(completeGoal(host, "s1", "ok", "tests")).rejects.toThrow("active goal");
+  store.set("goal:s1", { status: "waiting", waiting: { dependencies: [] } });
+  await expect(completeGoal(host, "s1", "ok", "tests")).rejects.toThrow("active goal");
+  await expect(completeGoal(host, "s1", " ", "tests")).rejects.toThrow("required");
+});
 
 /** Lets the background goal loop run until it settles. */
 async function settle(host: Host, sessionID: string) {

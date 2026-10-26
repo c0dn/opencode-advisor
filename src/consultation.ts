@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode/plugin"
-import { resolveAdvisorModel } from "./config.ts"
+import { resolveAdvisorModel, requireAdvisor } from "./config.ts"
 import type { Host } from "./host.ts"
 import { renderTranscript } from "./transcript.ts"
 
@@ -22,14 +22,19 @@ export async function installConsultations(context: Plugin.Context, host: Host):
   const model = await context.tool.hook("execute.before", async (event) => {
     if (event.tool !== "subagent" || !event.input || typeof event.input !== "object") return
     const input = event.input as Record<string, unknown>
-    if (input.agent !== "advisor" || (typeof input.model === "string" && input.model.trim())) return
+    const continued = typeof input.sessionID === "string" ? await context.session.get({ sessionID: input.sessionID }) : undefined
+    if (input.agent !== "advisor" && continued?.agent !== "advisor") return
+    await requireAdvisor(host)
+    if (typeof input.model === "string" && input.model.trim()) return
     const { spec } = await resolveAdvisorModel(host)
     if (spec) event.input = { ...input, model: spec }
   })
 
   const prompt = await context.session.hook("prompt", async (event) => {
     const child = await context.session.get({ sessionID: event.sessionID })
-    if (child.agent !== "advisor" || !child.parentID) return
+    if (child.agent !== "advisor") return
+    await requireAdvisor(host)
+    if (!child.parentID) return
     // Fetch only this child's recorded parent, never an ID supplied in the prompt.
     // The prompt hook runs once per consultation, not once per model/tool step.
     const messages = await context.session.context({ sessionID: child.parentID })

@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 
 import { advisorCommand, commandArgs, goalCommand } from "./src/commands.ts"
-import { loadGoal, resumeRunningGoals, waitForDependencies, type JobInput } from "./src/goal.ts"
+import { completeGoal, loadGoal, resumeRunningGoals, waitForDependencies, type JobInput } from "./src/goal.ts"
 import type { Host } from "./src/host.ts"
 import { installConsultations } from "./src/consultation.ts"
 import { Advisor } from "./src/rpc.ts"
@@ -73,6 +73,21 @@ export default Plugin.define({
 
     const tools = await context.tool.transform((draft) => {
       if (!goalEnabled) return
+      if (host.options.external_judge === false) draft.add({
+        name: "goal_complete",
+        description: "Mark the active goal complete and stop automatic continuation. Only after verification and handling all registered background dependencies. Provide concrete verification evidence, not just a claim of success.",
+        input: {
+          type: "object",
+          properties: { summary: { type: "string", minLength: 1 }, verification: { type: "string", minLength: 1 } },
+          required: ["summary", "verification"], additionalProperties: false,
+        },
+        options: { codemode: false as const },
+        async execute(input, toolContext) {
+          const args = input as { summary: string; verification: string }
+          await completeGoal(host, toolContext.sessionID, args.summary, args.verification)
+          return { content: "Goal completed. Automatic continuation stopped." }
+        },
+      })
       draft.add({
         name: "goal_wait",
         description: "Suspend /goal judging while waiting for background work, then end your turn. ids: native background shell IDs or child sessionIDs from this session (short waits; native completion wakes you; lost if OpenCode restarts or drops the shell). jobs: detached work launched with the plugin's oc-job script (systemd --user unit, or a pid on macOS), systemd-run or setsid (training, long evals); the plugin checks the log's EXIT= marker, unit or pid from host state, survives OpenCode restarts, and queues the result turn itself. A lost or expired dependency gets one reconcile turn. Do not poll or duplicate the work. Not for persistent dev servers.",

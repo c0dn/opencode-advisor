@@ -33,6 +33,32 @@ Goals survive an OpenCode restart. Round updates appear as toasts, and as a desk
 
 ## Waiting for background work
 
+### Optional agent-owned completion
+
+Set `"external_judge": false` in this plugin's `options` to skip goal verdict
+model calls. The default is `true`, preserving independent judging. In judge-free
+mode, an idle turn continues the goal until the agent calls
+`goal_complete({summary: "…", verification: "tests/checks and their results"})`.
+The completion tool is only exposed in this mode and rejects inactive goals,
+registered waits, and blank evidence. Evidence is reported by the agent, not
+independently validated. Round limits and interrupted-turn handling still apply;
+advisor-based stall detection is unavailable. Use `/goal stop` when blocked.
+`goal_wait` still suspends continuation and supports restart-safe jobs.
+
+### Disable consultations separately
+
+`/advisor off` blocks native advisor invocations for this project, including
+explicit model overrides and follow-ups. `/advisor on` re-enables them without
+changing the selected model. Add `--global` to set the default for all projects;
+an explicit project setting takes precedence. `/advisor` displays both the
+consultation status and goal judge mode. `/advisor reset [--global]` clears both
+model and consultation overrides for that scope, restoring inheritance.
+
+These switches are independent: `/advisor off` does not disable goal verdicts,
+and `external_judge: false` does not disable manual consultations. To avoid both
+kinds of advisor-model calls, use both settings. Turning consultations off blocks
+new requests; it does not cancel an already-running request.
+
 When no independent work remains, call `goal_wait` and end the turn. Waiting uses no
 model calls or goal rounds. Failure and cancellation are evidence for the parent, not
 success. There are two kinds of dependency.

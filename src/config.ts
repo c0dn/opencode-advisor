@@ -46,3 +46,26 @@ export async function setAdvisorModel(host: Host, spec: string, scope: "project"
 export async function resetAdvisorModel(host: Host, scope: "project" | "global"): Promise<void> {
   await host.storage.remove(scope === "project" ? projectKey(host.project) : GLOBAL_KEY);
 }
+
+const enabledKey = (host: Host, scope: "project" | "global") =>
+  scope === "project" ? `advisor.enabled.project:${host.project}` : "advisor.enabled.global";
+
+export async function advisorEnabled(host: Host): Promise<{ enabled: boolean; source: string }> {
+  for (const scope of ["project", "global"] as const) {
+    const value = await host.storage.get(enabledKey(host, scope));
+    if (typeof value === "boolean") return { enabled: value, source: scope };
+  }
+  return { enabled: true, source: "default" };
+}
+
+export async function setAdvisorEnabled(host: Host, enabled: boolean, scope: "project" | "global"): Promise<void> {
+  await host.storage.set(enabledKey(host, scope), enabled);
+}
+
+export async function resetAdvisorEnabled(host: Host, scope: "project" | "global"): Promise<void> {
+  await host.storage.remove(enabledKey(host, scope));
+}
+
+export async function requireAdvisor(host: Host): Promise<void> {
+  if (!(await advisorEnabled(host)).enabled) throw new Error("Advisor consultations are disabled. Use /advisor on to enable them. Goal judging is controlled separately by external_judge.");
+}

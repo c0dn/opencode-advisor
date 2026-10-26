@@ -1,6 +1,7 @@
 import { describeModel, formatModel, parseModel, resetAdvisorModel, resolveAdvisorModel, setAdvisorModel } from "./config.ts";
 import { DEFAULT_MAX_ROUNDS, loadGoal, resumeGoal, startGoal, stopGoal } from "./goal.ts";
 import type { Host } from "./host.ts";
+import { advisorEnabled, setAdvisorEnabled, resetAdvisorEnabled } from "./config.ts";
 
 /** The command's argument text, without the `/name` a client may leave in front. */
 export function commandArgs(name: string, text: string): string {
@@ -10,7 +11,8 @@ export function commandArgs(name: string, text: string): string {
 export const ADVISOR_USAGE = `/advisor — show the advisor model and where it is set
 /advisor <provider/model[#variant]> — set it for this project
 /advisor --global <provider/model[#variant]> — set the default for all projects
-/advisor reset [--global] — clear the project (or global) setting`;
+/advisor on|off [--global] — enable or disable consultations, not goal judging
+/advisor reset [--global] — clear model and consultation overrides`;
 
 /** Handles /advisor; returns the reply to show. */
 export async function advisorCommand(host: Host, args: string): Promise<string> {
@@ -21,10 +23,17 @@ export async function advisorCommand(host: Host, args: string): Promise<string> 
 
   if (rest.length === 0) {
     const { spec, source } = await resolveAdvisorModel(host);
-    return `Advisor model: ${describeModel(spec)} (from ${source}).\n\n${ADVISOR_USAGE}`;
+    const status = await advisorEnabled(host);
+    return `Advisor consultations: ${status.enabled ? "on" : "off"} (from ${status.source}).\nAdvisor model: ${describeModel(spec)} (from ${source}).\nGoal external judge: ${host.options.external_judge !== false ? "on" : "off"} (independent).\n\n${ADVISOR_USAGE}`;
+  }
+  if (rest[0] === "on" || rest[0] === "off") {
+    if (rest.length !== 1) throw new Error("Use /advisor on|off [--global].");
+    await setAdvisorEnabled(host, rest[0] === "on", scope);
+    return `Advisor consultations ${rest[0]} for ${scope}. Selected model preserved; external_judge is unchanged.`;
   }
   if (rest[0] === "reset") {
     await resetAdvisorModel(host, scope);
+    await resetAdvisorEnabled(host, scope);
     const { spec, source } = await resolveAdvisorModel(host);
     return `Cleared the ${scope} advisor model. Now using ${describeModel(spec)} (from ${source}).`;
   }

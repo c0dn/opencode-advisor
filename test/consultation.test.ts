@@ -28,6 +28,12 @@ test("native consultation hooks scope evidence, preserve explicit models and den
   model.input.model = "explicit/choice"
   await hooks["tool.execute.before"]!(model)
   expect(model.input.model).toBe("explicit/choice")
+  store.set("advisor.enabled.project:/project", false)
+  await expect(hooks["tool.execute.before"]!(model)).rejects.toThrow("disabled")
+  await expect(hooks["tool.execute.before"]!({ tool: "subagent", input: { sessionID: "child" } })).rejects.toThrow("disabled")
+  await expect(hooks["session.prompt"]!({ sessionID: "child", prompt: { text: "bypass" } })).rejects.toThrow("disabled")
+  await hooks["tool.execute.before"]!({ tool: "subagent", input: { agent: "researcher" } })
+  store.set("advisor.enabled.project:/project", true)
   const prompt = { sessionID: "child", prompt: { text: "review this" } }
   await hooks["session.prompt"]!(prompt)
   expect(reads).toEqual(["parent"])

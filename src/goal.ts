@@ -142,14 +142,16 @@ function roundMarker(goal: Goal): string {
   return `[goal round ${goal.round + 1}/${goal.maxRounds ?? "∞"}]`;
 }
 
-function kickoffText(goal: Goal): string {
+const selfInstructions = "External judging is disabled. Continue until verified, then call goal_complete with summary and verification evidence. Ending a turn is not completion. Use goal_wait for pending background work; do not duplicate it. If blocked, explain what is needed and ask the user to /goal stop.";
+
+function kickoffText(goal: Goal, host: Host): string {
   return `${roundMarker(goal)} New goal. Work on it autonomously until it is fully met and verified.
 
 Goal: ${goal.text}
 
-An independent advisor will judge your progress after each turn from the transcript, so
+${host.options.external_judge === false ? selfInstructions : `An independent advisor will judge your progress after each turn from the transcript, so
 show your evidence: run the tests or checks that prove each part is done. Don't stop to
-ask the user unless you are truly blocked; if you are, say exactly what you need.`;
+ask the user unless you are truly blocked; if you are, say exactly what you need.`}`;
 }
 
 function continueText(goal: Goal, verdict: Verdict): string {
@@ -277,6 +279,16 @@ async function run(host: Host, sessionID: string): Promise<void> {
       const messages = await host.context(sessionID);
       if (lastTurnFailed(messages)) return pause(host, goal, "the last turn was interrupted or ended in an error");
 
+      if (host.options.external_judge === false) {
+        const current = await loadGoal(host, sessionID);
+        if (!current || current.status === "done" || current.status === "stopped" || current.status === "paused") return;
+        if (current.status === "waiting" || current.pendingTurn) continue;
+        current.round += 1;
+        if (current.maxRounds != null && current.round >= current.maxRounds) return pause(host, current, `reached the limit of ${current.maxRounds} rounds`);
+        await enqueueTurn(host, current, `${roundMarker(current)} Continue toward the goal: ${current.text}\n\n${selfInstructions}`);
+        continue;
+      }
+
       const verdict = await judge(host, goal, messages);
       if (host.signal?.aborted) return;
       // A /goal stop while the advisor was thinking wins.
@@ -320,7 +332,7 @@ export async function startGoal(host: Host, sessionID: string, text: string, max
     throw new Error(`A goal is already running here: "${existing.text}". /goal stop it first.`);
   }
   const goal: Goal = { sessionID, text, status: "running", round: 0, maxRounds, started: Date.now(), feedback: [] };
-  await enqueueTurn(host, goal, kickoffText(goal));
+  await enqueueTurn(host, goal, kickoffText(goal, host));
   void run(host, sessionID);
 }
 
@@ -335,7 +347,7 @@ export async function resumeGoal(host: Host, sessionID: string, extraRounds?: nu
   goal.feedback = [];
   goal.maxRounds = extraRounds === undefined ? DEFAULT_MAX_ROUNDS : goal.round + extraRounds;
   const marker = roundMarker(goal);
-  await enqueueTurn(host, goal, `${marker} Resuming the goal. Continue from where you left off.\n\nGoal: ${goal.text}`);
+  await enqueueTurn(host, goal, `${marker} Resuming the goal. Continue from where you left off.\n\nGoal: ${goal.text}${host.options.external_judge === false ? `\n\n${selfInstructions}` : ""}`);
   void run(host, sessionID);
   return goal;
 }
@@ -347,6 +359,18 @@ export async function stopGoal(host: Host, sessionID: string): Promise<Goal | un
   goal.reason = "stopped by the user";
   await saveGoal(host, goal);
   return goal;
+}
+
+export async function completeGoal(host: Host, sessionID: string, summary: string, verification: string): Promise<void> {
+  if (host.options.external_judge !== false) throw new Error("goal_complete requires external_judge: false.");
+  if (!summary.trim() || !verification.trim()) throw new Error("Summary and verification evidence are required.");
+  const goal = await loadGoal(host, sessionID);
+  if (!goal || goal.status !== "running" || goal.waiting) throw new Error("An active goal with no registered wait is required. Handle dependencies before completing.");
+  goal.status = "done";
+  goal.reason = `${summary.trim()}\nVerification: ${verification.trim()}`;
+  goal.pendingTurn = undefined;
+  await saveGoal(host, goal);
+  await host.notify(sessionID, `Goal completed by agent: ${goal.reason}`);
 }
 
 /** Picks up goals that were running when OpenCode last stopped. */

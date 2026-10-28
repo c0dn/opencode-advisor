@@ -115,7 +115,7 @@ boundary causes a fresh bounded snapshot. Model/tool steps do not append it agai
 An explicit native subagent model override wins over `/advisor` settings.
 
 Advisor and researcher permission hooks deny mutation, shell, nested delegation
-and approval-dependent actions. Use read/glob/grep and Jina retrieval; have the
+and approval-dependent actions. Use read/glob/grep and Keenable (or Jina) retrieval; have the
 parent run authenticated CLI checks. Configure their agent permissions deny-first
 as well. No custom child runner, polling scheduler or log-monitor plugin is needed.
 

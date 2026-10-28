@@ -54,7 +54,7 @@ export async function installConsultations(context: Plugin.Context, host: Host):
     if (agent !== "advisor" && agent !== "researcher") return
     // Do not rely on edit denial while leaving arbitrary shell/MCP mutation available.
     const readOnly = ["read", "list", "glob", "grep", "skill", "execute", "external_directory"].includes(event.action)
-      || /^jina[_.]/.test(event.action)
+      || /^(?:jina|keenable)[_.]/.test(event.action)
     const sensitive = event.resources.some((resource) => /(?:^|[/\\])(?:\.ssh|\.gnupg|secrets|\.env(?:\.[^/\\]*)?|auth\.json|mcp-auth\.json)(?:[/\\]|$)/i.test(resource))
     if (!readOnly || sensitive || event.effect === "ask") {
       event.effect = "deny"

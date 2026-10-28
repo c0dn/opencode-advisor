@@ -53,6 +53,11 @@ test("native consultation hooks scope evidence, preserve explicit models and den
       await hooks["permission.evaluate"]!(event)
       expect(event.effect).toBe("deny")
     }
+    for (const action of ["keenable_search_web_pages", "keenable_fetch_page_content", "jina_read_url"]) {
+      const web = { agent, action, effect: "allow", resources: ["*"] }
+      await hooks["permission.evaluate"]!(web)
+      expect(web.effect).toBe("allow")
+    }
     const read = { agent, action: "read", effect: "allow", resources: ["/repo/file.ts"] }
     await hooks["permission.evaluate"]!(read)
     expect(read.effect).toBe("allow")
